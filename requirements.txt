@@ -1,0 +1,2 @@
+# Pure stdlib, no external deps needed.
+# Kept for convention and CI compatibility.
