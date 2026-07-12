@@ -46,9 +46,9 @@ echo "  Script: $PY_BASENAME"
 mkdir -p "$REPO_DIR/issues/open" "$REPO_DIR/issues/closed"
 
 # check git config
-if ! git -C "$REPO_DIR" config user.email &>/dev/null; then
+if ! git -C "$REPO_DIR" config user.name &>/dev/null || ! git -C "$REPO_DIR" config user.email &>/dev/null; then
     echo ""
-    echo "WARNING: Git user.email not set in this repo."
+    echo "WARNING: Git user.name or user.email not set in this repo."
     echo "  git config user.name \"Your Name\""
     echo "  git config user.email \"you@example.com\""
 fi
@@ -72,7 +72,7 @@ After=network.target
 [Service]
 Type=oneshot
 WorkingDirectory=$REPO_DIR
-ExecStart=$PYTHON $REPO_DIR/$PY_BASENAME
+ExecStart="$PYTHON" "$REPO_DIR/$PY_BASENAME"
 StandardOutput=journal
 StandardError=journal
 EOF
@@ -96,6 +96,7 @@ systemctl --user daemon-reload
 systemctl --user enable "$TIMER_NAME"
 
 echo ""
+echo "Note: Persistent=true means missed runs fire immediately on boot."
 echo "Done. Timer enabled for user $(whoami)."
 echo ""
 echo "Commands:"

@@ -1,12 +1,9 @@
-# Runtime state & logs
+# Runtime state (machine-only, never commit)
 .lazy_state.json
 activity.log
+pulls.log
+reviews.md
 issues/
-*.log
-*.md
-!README.md
-!SECURITY.md
-!CONTRIBUTING.md
 
 # Editor
 *.swp

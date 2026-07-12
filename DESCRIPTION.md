@@ -1,0 +1,1 @@
+Auto-green your GitHub graph without touching a keyboard. Generates realistic commits, pulls, reviews, and issue lifecycles in a private repo. Looks human, not robotic. Setup: private repo, enable Private Contributions, run ./install.sh, done. Timer handles the rest. Python 3.6+, Git, Linux. MIT.

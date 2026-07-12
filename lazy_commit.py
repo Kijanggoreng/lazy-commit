@@ -10,8 +10,8 @@ and tracking development velocity over time.
 Usage:
     python3 lazy_commit.py --plan           # preview this month's schedule
     python3 lazy_commit.py --dry-run        # simulate without writing
-    python3 lazy_commit.py --force        # force a single commit now
-    python3 lazy_commit.py --no-push       # commit only, skip remote sync
+    python3 lazy_commit.py --force          # force a single commit now
+    python3 lazy_commit.py --no-push        # commit only, skip remote sync
 """
 
 import os
@@ -20,7 +20,7 @@ import json
 import random
 import subprocess
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime
 import calendar
 
 # --- config -----------------------------------------------------------------
@@ -87,9 +87,11 @@ FEATURES = ["OAuth2", "WebSocket", "SSE", "GraphQL", "batch processing", "rate l
 
 # --- helpers ----------------------------------------------------------------
 
-def run_git(args, cwd=REPO_DIR, check=True, capture=False):
+def run_git(args, cwd=REPO_DIR, check=True, capture=False, timeout=30, env=None):
     cmd = ["git"] + args
-    kwargs = {"cwd": cwd, "text": True}
+    kwargs = {"cwd": cwd, "text": True, "timeout": timeout}
+    if env is not None:
+        kwargs["env"] = env
     if capture:
         kwargs["capture_output"] = True
     if check:
@@ -98,6 +100,7 @@ def run_git(args, cwd=REPO_DIR, check=True, capture=False):
 
 def git_configured():
     try:
+        run_git(["config", "user.name"], check=True, capture=True)
         run_git(["config", "user.email"], check=True, capture=True)
         return True
     except Exception:
@@ -112,7 +115,7 @@ def has_remote():
 
 def get_today_commits():
     try:
-        result = run_git(["log", "--since=midnight", "--oneline", "--all"], capture=True)
+        result = run_git(["log", "--since=midnight", "--oneline"], capture=True)
         if not result.stdout.strip():
             return 0
         lines = [l for l in result.stdout.strip().split("\n") if l.strip()]
@@ -120,17 +123,24 @@ def get_today_commits():
     except Exception:
         return 0
 
-def current_week():
-    return datetime.now().isocalendar()[1]
+def current_year_week():
+    """Return (year, week) tuple for proper year-boundary tracking."""
+    iso = datetime.now().isocalendar()
+    return (iso[0], iso[1])
 
 def current_biweek():
-    w = datetime.now().isocalendar()[1]
-    return (w // 2) + 1
+    """Biweek 1-26, consistent year-round."""
+    iso = datetime.now().isocalendar()
+    # Week 1 always starts biweek 1
+    return ((iso[1] - 1) // 2) + 1
 
 def day_of_biweek():
+    """Return day 1-14 within current biweek."""
     now = datetime.now()
-    doy = now.timetuple().tm_yday
-    return ((doy - 1) % 14) + 1
+    iso = now.isocalendar()
+    week_in_year = iso[1]
+    # Day of biweek: ((week - 1) % 2) * 7 + weekday
+    return (((week_in_year - 1) % 2) * 7) + iso[2]
 
 def ensure_dirs():
     for d in [ISSUES_DIR, ISSUES_OPEN_DIR, ISSUES_CLOSED_DIR]:
@@ -204,7 +214,10 @@ def generate_commit_plan(year, month, seed, prev_plan=None):
     return plan
 
 def generate_weekly_plan(year, week, seed, activity_name, max_per_week=3):
-    rng = random.Random(year * 1000 + week * 10 + seed + hash(activity_name) % 1000)
+    # Use string hash for cross-platform deterministic seeding
+    hash_input = f"{year}-{week}-{activity_name}"
+    hash_val = sum(ord(c) * (31 ** i) for i, c in enumerate(hash_input)) & 0xFFFFFFFF
+    rng = random.Random(year * 10000 + week * 100 + seed + hash_val)
     target = rng.randint(0, max_per_week)
     if target == 0:
         return {"target": 0, "days": []}
@@ -261,19 +274,23 @@ def generate_issue_close_plan(year, month, seed, open_issues_count):
 def load_or_create_state(seed=DEFAULT_SEED, force_regen=False):
     now = datetime.now()
     year, month = now.year, now.month
-    week = current_week()
+    yw = current_year_week()
     biweek = current_biweek()
 
     if os.path.exists(STATE_FILE) and not force_regen:
-        with open(STATE_FILE, "r") as f:
-            state = json.load(f)
+        try:
+            with open(STATE_FILE, "r") as f:
+                state = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            state = {}
     else:
         state = {}
 
     changed = False
 
+    # Commit plan: regenerate on month change
     if state.get("year") != year or state.get("month") != month or "commit_plan" not in state:
-        prev_plan = state.get("commit_plan", {}) if state.get("month") == month - 1 else {}
+        prev_plan = state.get("commit_plan", {}) if state.get("month") == month - 1 and state.get("year") == year else {}
         state["year"] = year
         state["month"] = month
         state["commit_plan"] = generate_commit_plan(year, month, seed, prev_plan)
@@ -284,26 +301,28 @@ def load_or_create_state(seed=DEFAULT_SEED, force_regen=False):
     if "review_plan" not in state:
         state["review_plan"] = {}
 
-    wkey = str(week)
+    # Weekly plan: use year-week tuple as key
+    wkey = f"{yw[0]}-W{yw[1]:02d}"
     if wkey not in state["pull_plan"]:
-        state["pull_plan"][wkey] = generate_weekly_plan(year, week, seed, "pull", 3)
+        state["pull_plan"][wkey] = generate_weekly_plan(yw[0], yw[1], seed, "pull", 3)
         changed = True
     if wkey not in state["review_plan"]:
-        state["review_plan"][wkey] = generate_weekly_plan(year, week, seed, "review", 3)
+        state["review_plan"][wkey] = generate_weekly_plan(yw[0], yw[1], seed, "review", 3)
         changed = True
 
     if "issue_plan" not in state:
         state["issue_plan"] = {}
 
-    bkey = str(biweek)
+    bkey = f"{year}-B{biweek:02d}"
     if bkey not in state["issue_plan"]:
         state["issue_plan"][bkey] = generate_issue_plan(year, biweek, seed)
+        state["last_spawn_date"] = None  # reset for new biweek
         changed = True
 
     if "issue_close_plan" not in state:
         state["issue_close_plan"] = {}
 
-    mkey = str(month)
+    mkey = f"{year}-M{month:02d}"
     if mkey not in state["issue_close_plan"]:
         open_count = len([i for i in state.get("issues", []) if i.get("status") == "open"])
         state["issue_close_plan"][mkey] = generate_issue_close_plan(year, month, seed, open_count)
@@ -318,6 +337,9 @@ def load_or_create_state(seed=DEFAULT_SEED, force_regen=False):
     if "log" not in state:
         state["log"] = []
         changed = True
+    if "last_spawn_date" not in state:
+        state["last_spawn_date"] = None
+        changed = True
 
     if changed:
         save_state(state)
@@ -325,24 +347,70 @@ def load_or_create_state(seed=DEFAULT_SEED, force_regen=False):
     return state
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
+    # Cleanup old plan keys (older than 6 months)
+    now = datetime.now()
+    cutoff_year = now.year
+    cutoff_month = now.month - 6
+    if cutoff_month <= 0:
+        cutoff_year -= 1
+        cutoff_month += 12
+
+    for key in list(state.get("pull_plan", {}).keys()):
+        try:
+            y = int(key.split("-W")[0])
+            w = int(key.split("-W")[1])
+            # Rough check: older than ~26 weeks
+            if y < cutoff_year or (y == cutoff_year and w < (cutoff_month * 4)):
+                del state["pull_plan"][key]
+        except (ValueError, IndexError):
+            pass
+
+    for key in list(state.get("review_plan", {}).keys()):
+        try:
+            y = int(key.split("-W")[0])
+            w = int(key.split("-W")[1])
+            if y < cutoff_year or (y == cutoff_year and w < (cutoff_month * 4)):
+                del state["review_plan"][key]
+        except (ValueError, IndexError):
+            pass
+
+    for key in list(state.get("issue_plan", {}).keys()):
+        try:
+            y = int(key.split("-B")[0])
+            if y < cutoff_year:
+                del state["issue_plan"][key]
+        except (ValueError, IndexError):
+            pass
+
+    for key in list(state.get("issue_close_plan", {}).keys()):
+        try:
+            y = int(key.split("-M")[0])
+            if y < cutoff_year:
+                del state["issue_close_plan"][key]
+        except (ValueError, IndexError):
+            pass
+
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
+    os.replace(tmp, STATE_FILE)
 
 # --- actions ----------------------------------------------------------------
 
-def make_commit(extra_msg=None, push=True):
+def make_commit(extra_msg=None, push=True, seed=DEFAULT_SEED):
     now = datetime.now()
     if not os.path.exists(ACTIVITY_FILE):
         with open(ACTIVITY_FILE, "w") as f:
             f.write("# Activity Log\n\n")
 
     verbs = ["update", "sync", "progress", "checkpoint", "refactor", "patch", "tweak", "polish", "clean", "optimize"]
-    entry = f"[{now.strftime('%Y-%m-%d %H:%M')}] {random.choice(verbs)}\n"
+    rng = random.Random(seed + now.year * 10000 + now.month * 100 + now.day * 10 + now.hour)
+    entry = f"[{now.strftime('%Y-%m-%d %H:%M')}] {rng.choice(verbs)}\n"
     with open(ACTIVITY_FILE, "a") as f:
         f.write(entry)
 
     run_git(["add", "-A"])
-    msg = extra_msg if extra_msg else random.choice(COMMIT_MESSAGES)
+    msg = extra_msg if extra_msg else rng.choice(COMMIT_MESSAGES)
 
     date_str = now.strftime("%Y-%m-%d %H:%M:%S %z")
     if not date_str.endswith("Z") and "+" not in date_str and "-" not in date_str[-5:]:
@@ -352,11 +420,12 @@ def make_commit(extra_msg=None, push=True):
     env["GIT_AUTHOR_DATE"] = date_str
     env["GIT_COMMITTER_DATE"] = date_str
 
-    run_git(["commit", "-m", msg], check=True)
+    # --allow-empty: commit even if nothing staged (e.g. only gitignored files changed)
+    run_git(["commit", "--allow-empty", "-m", msg], check=True, env=env)
 
     if push and has_remote():
         try:
-            run_git(["push"], check=False, capture=True)
+            run_git(["push"], check=False, capture=True, timeout=60)
         except Exception:
             pass
     return msg
@@ -367,8 +436,10 @@ def do_pull(state):
         return "no remote"
 
     try:
-        result = run_git(["pull", "--ff-only"], check=False, capture=True)
+        result = run_git(["pull", "--ff-only"], check=False, capture=True, timeout=60)
         status = "pulled" if result.returncode == 0 else "failed"
+    except subprocess.TimeoutExpired:
+        status = "timeout"
     except Exception as e:
         status = f"error: {e}"
 
@@ -387,19 +458,20 @@ def do_pull(state):
     })
     return status
 
-def do_review(state):
+def do_review(state, push=True, seed=DEFAULT_SEED):
     now = datetime.now()
     ensure_dirs()
 
-    comment = random.choice(REVIEW_COMMENTS)
-    module = random.choice(MODULES)
+    rng = random.Random(seed + now.year * 10000 + now.month * 100 + now.day * 10 + now.hour + 1)
+    comment = rng.choice(REVIEW_COMMENTS)
+    module = rng.choice(MODULES)
 
     entry = f"\n## Review {now.strftime('%Y-%m-%d %H:%M')} -- {module}\n\n{comment}\n"
     with open(REVIEWS_FILE, "a") as f:
         f.write(entry)
 
     msg = f"review: {module} -- {comment[:40]}..."
-    make_commit(msg)
+    make_commit(msg, push=push, seed=seed)
 
     state["log"].append({
         "time": now.isoformat(),
@@ -409,23 +481,25 @@ def do_review(state):
     })
     return msg
 
-def create_issue(state):
+def create_issue(state, push=True, seed=DEFAULT_SEED):
     now = datetime.now()
     ensure_dirs()
 
+    rng = random.Random(seed + now.year * 10000 + now.month * 100 + now.day * 10 + now.hour + 2)
     issue_id = state["next_issue_id"]
     state["next_issue_id"] = issue_id + 1
 
-    title_template = random.choice(ISSUE_TITLES)
-    module = random.choice(MODULES)
-    feature = random.choice(FEATURES)
+    title_template = rng.choice(ISSUE_TITLES)
+    module = rng.choice(MODULES)
+    feature = rng.choice(FEATURES)
     title = title_template.format(module=module, feature=feature)
 
-    body_template = random.choice(ISSUE_BODIES)
+    body_template = rng.choice(ISSUE_BODIES)
     body = body_template.format(module=module, feature=feature)
 
-    complexity = random.randint(1, 3)
-    planned_close_month = state["month"] + (complexity - 1)
+    complexity = rng.randint(1, 3)
+    raw_month = state["month"] + (complexity - 1)
+    planned_close_month = ((raw_month - 1) % 12) + 1
 
     issue = {
         "id": issue_id,
@@ -449,7 +523,7 @@ def create_issue(state):
         f.write(body)
 
     msg = f"issue: open #{issue_id} -- {title[:50]}"
-    make_commit(msg)
+    make_commit(msg, push=push, seed=seed)
 
     state["log"].append({
         "time": now.isoformat(),
@@ -459,7 +533,7 @@ def create_issue(state):
     })
     return issue_id
 
-def close_issue(state, issue_id):
+def close_issue(state, issue_id, push=True, seed=DEFAULT_SEED):
     now = datetime.now()
     ensure_dirs()
 
@@ -487,7 +561,7 @@ def close_issue(state, issue_id):
         os.remove(old_path)
 
     msg = f"issue: close #{issue_id} -- {issue['title'][:45]}"
-    make_commit(msg)
+    make_commit(msg, push=push, seed=seed)
 
     state["log"].append({
         "time": now.isoformat(),
@@ -526,6 +600,7 @@ def process_day(state, seed, dry_run=False, push=True):
         remaining = target - current
         hours_left = max(0, 22 - now.hour)
 
+        rng = random.Random(seed + now.year * 10000 + now.month * 100 + now.day * 10 + now.hour)
         if hours_left <= 0:
             should_commit = True
             reason = "last chance"
@@ -540,14 +615,14 @@ def process_day(state, seed, dry_run=False, push=True):
                 reason = f"afternoon push ({prob:.0%})"
             else:
                 reason = f"normal ({prob:.0%})"
-            should_commit = random.random() < prob
+            should_commit = rng.random() < prob
 
         if should_commit:
             if dry_run:
                 actions_taken.append(f"[DRY] commit ({reason})")
             else:
                 try:
-                    msg = make_commit(push=push)
+                    msg = make_commit(push=push, seed=seed)
                     current += 1
                     actions_taken.append(f"Commit: \"{msg[:40]}...\" ({current}/{target})")
                 except Exception as e:
@@ -558,7 +633,8 @@ def process_day(state, seed, dry_run=False, push=True):
         actions_taken.append(f"Commit target reached ({current}/{target})")
 
     # 2. pull
-    wkey = str(current_week())
+    yw = current_year_week()
+    wkey = f"{yw[0]}-W{yw[1]:02d}"
     if should_do_today(state["pull_plan"], wkey, weekday):
         if dry_run:
             actions_taken.append("[DRY] pull origin")
@@ -574,36 +650,48 @@ def process_day(state, seed, dry_run=False, push=True):
             actions_taken.append("[DRY] code review")
             state["review_plan"][wkey]["done"] = state["review_plan"][wkey].get("done", 0) + 1
         else:
-            msg = do_review(state)
+            msg = do_review(state, push=push, seed=seed)
             state["review_plan"][wkey]["done"] = state["review_plan"][wkey].get("done", 0) + 1
             actions_taken.append(f"Review: {msg[:50]}...")
 
-    # 4. issue spawn
-    bkey = str(current_biweek())
+    # 4. issue spawn (max once per day)
+    bkey = f"{now.year}-B{current_biweek():02d}"
     biweek_plan = state["issue_plan"].get(bkey, {})
+    today_str = now.strftime("%Y-%m-%d")
+    already_spawned = state.get("last_spawn_date") == today_str
 
-    if biweek_plan.get("random_event", False):
-        spawn_days = biweek_plan.get("spawn_days", [])
-        if spawn_days and dob == spawn_days[0] and biweek_plan.get("done", 0) < biweek_plan.get("target_new", 0):
-            to_spawn = biweek_plan["target_new"] - biweek_plan.get("done", 0)
-            for _ in range(to_spawn):
-                if dry_run:
-                    actions_taken.append("[DRY] spawn issue (random event)")
-                else:
-                    iid = create_issue(state)
-                    actions_taken.append(f"Issue #{iid} created (random event)")
-                biweek_plan["done"] = biweek_plan.get("done", 0) + 1
-    else:
-        if dob in biweek_plan.get("spawn_days", []) and biweek_plan.get("done", 0) < biweek_plan.get("target_new", 0):
-            if dry_run:
-                actions_taken.append("[DRY] spawn issue")
+    if not already_spawned and biweek_plan.get("done", 0) < biweek_plan.get("target_new", 0):
+        should_spawn = False
+        if biweek_plan.get("random_event", False):
+            spawn_days = biweek_plan.get("spawn_days", [])
+            if spawn_days and dob == spawn_days[0]:
+                should_spawn = True
+        else:
+            if dob in biweek_plan.get("spawn_days", []):
+                should_spawn = True
+
+        if should_spawn:
+            if biweek_plan.get("random_event", False):
+                to_spawn = biweek_plan["target_new"] - biweek_plan.get("done", 0)
+                for _ in range(to_spawn):
+                    if dry_run:
+                        actions_taken.append("[DRY] spawn issue (random event)")
+                    else:
+                        iid = create_issue(state, push=push, seed=seed)
+                        actions_taken.append(f"Issue #{iid} created (random event)")
+                    biweek_plan["done"] = biweek_plan.get("done", 0) + 1
             else:
-                iid = create_issue(state)
-                actions_taken.append(f"Issue #{iid} created")
-            biweek_plan["done"] = biweek_plan.get("done", 0) + 1
+                if dry_run:
+                    actions_taken.append("[DRY] spawn issue")
+                else:
+                    iid = create_issue(state, push=push, seed=seed)
+                    actions_taken.append(f"Issue #{iid} created")
+                biweek_plan["done"] = biweek_plan.get("done", 0) + 1
+            if not dry_run:
+                state["last_spawn_date"] = today_str
 
     # 5. issue close
-    mkey = str(now.month)
+    mkey = f"{now.year}-M{now.month:02d}"
     close_plan = state["issue_close_plan"].get(mkey, {})
     if now.day in close_plan.get("close_days", []) and close_plan.get("done", 0) < close_plan.get("target_close", 0):
         open_issues = [i for i in state["issues"] if i.get("status") == "open"]
@@ -615,7 +703,7 @@ def process_day(state, seed, dry_run=False, push=True):
             if dry_run:
                 actions_taken.append(f"[DRY] close issue #{to_close['id']}")
             else:
-                close_issue(state, to_close["id"])
+                close_issue(state, to_close["id"], push=push, seed=seed)
                 actions_taken.append(f"Issue #{to_close['id']} closed")
             close_plan["done"] = close_plan.get("done", 0) + 1
 
@@ -643,25 +731,25 @@ def print_full_plan(state):
     print(f"  -> {rest_count} rest days, {total} total commits")
 
     print("\nPull Plan (per week):")
-    for wkey, plan in sorted(state["pull_plan"].items(), key=lambda x: int(x[0])):
+    for wkey, plan in sorted(state["pull_plan"].items(), key=lambda x: x[0]):
         days = plan.get("days", [])
         day_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
         dstr = ", ".join(day_names[d-1] for d in days) if days else "none"
         print(f"  Week {wkey}: {plan.get('target', 0)}x -- {dstr}")
 
     print("\nReview Plan (per week):")
-    for wkey, plan in sorted(state["review_plan"].items(), key=lambda x: int(x[0])):
+    for wkey, plan in sorted(state["review_plan"].items(), key=lambda x: x[0]):
         days = plan.get("days", [])
         day_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
         dstr = ", ".join(day_names[d-1] for d in days) if days else "none"
         print(f"  Week {wkey}: {plan.get('target', 0)}x -- {dstr}")
 
     print("\nIssue Plan:")
-    for bkey, plan in sorted(state["issue_plan"].items(), key=lambda x: int(x[0])):
+    for bkey, plan in sorted(state["issue_plan"].items(), key=lambda x: x[0]):
         ev = " [RANDOM EVENT]" if plan.get("random_event") else ""
         print(f"  Biweek {bkey}: {plan.get('target_new', 0)} new{ev}")
 
-    for mkey, plan in sorted(state["issue_close_plan"].items(), key=lambda x: int(x[0])):
+    for mkey, plan in sorted(state["issue_close_plan"].items(), key=lambda x: x[0]):
         print(f"  Month {mkey}: close {plan.get('target_close', 0)} issues")
 
     open_issues = [i for i in state.get("issues", []) if i.get("status") == "open"]
@@ -710,7 +798,7 @@ def main():
         if args.dry_run:
             print("[DRY-RUN] Force commit")
         else:
-            msg = make_commit(push=not args.no_push)
+            msg = make_commit(push=not args.no_push, seed=args.seed)
             print(f'Force committed: "{msg}"')
         return
 
