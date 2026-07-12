@@ -70,7 +70,7 @@ Most "green graph" tools are dumb. They commit the same message at the same time
 ### Step 3: Clone & Setup
 
 ```bash
-git clone https://github.com/YOURNAME/lazy-commit.git
+git clone https://github.com/Kijanggoreng/lazy-commit.git
 cd lazy-commit
 
 # Drop all files from this repo into the folder
