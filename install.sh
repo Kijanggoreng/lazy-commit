@@ -94,6 +94,7 @@ EOF
 # reload & enable
 systemctl --user daemon-reload
 systemctl --user enable "$TIMER_NAME"
+systemctl --user start "$TIMER_NAME"
 
 echo ""
 echo "Note: Persistent=true means missed runs fire immediately on boot."
