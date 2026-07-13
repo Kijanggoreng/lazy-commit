@@ -1,0 +1,34 @@
+name: Sync Issues
+on:
+  workflow_dispatch:  # manual trigger
+  push:
+    paths:
+      - 'issues/**'
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync open issues
+        run: |
+          for f in issues/open/*.md; do
+            [ -f "$f" ] || continue
+            title=$(sed -n '1s/^# //p' "$f")
+            body=$(sed '1d' "$f" | grep -v '^\*\*')
+            gh issue create --title "$title" --body "$body" --label "bug" || echo "Skip/fail: $title"
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Sync closed issues
+        run: |
+          for f in issues/closed/*.md; do
+            [ -f "$f" ] || continue
+            title=$(sed -n '1s/^# //p' "$f")
+            number=$(gh issue list --search "$title" --state open --json number,title --jq ".[] | select(.title==\"$title\") | .number")
+            [ -n "$number" ] && gh issue close "$number" --comment "Resolved."
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
